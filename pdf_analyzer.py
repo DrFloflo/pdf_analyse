@@ -150,6 +150,11 @@ class PDFAnalyzerApp:
             lbl_title = tk.Label(header, text=fname, font=("Arial", 10, "bold"), bg="#ddd")
             lbl_title.pack(side=tk.LEFT, padx=5)
 
+            # Copy File Data Button
+            btn_copy_file = tk.Button(header, text="Copy File Data", font=("Arial", 8),
+                                      command=lambda p=path: self.copy_file_data(p))
+            btn_copy_file.pack(side=tk.LEFT, padx=10)
+
             # Navigation Controls
             btn_prev = tk.Button(header, text="<", command=lambda p=path: self.change_page(p, -1))
             btn_prev.pack(side=tk.RIGHT, padx=2)
@@ -186,6 +191,9 @@ class PDFAnalyzerApp:
 
             # Hover binding (Mouse Move)
             canvas.bind("<Motion>", lambda event, p=path: self.on_mouse_move(event, p))
+
+            # Click binding (Copy)
+            canvas.bind("<Button-1>", lambda event, p=path: self.on_click(event, p))
 
             # Initialize tooltip for this canvas
             self.tooltips[canvas] = ToolTip(canvas)
@@ -303,12 +311,15 @@ class PDFAnalyzerApp:
         base_scale = state["base_scale"]
         total_scale = base_scale * current_zoom
 
+        # Initialize found_word before loop
+        found_word = None
+
         # --- Update Crosshair Cursor ---
         # Calculate PDF coordinates (un-scale)
         pdf_x = canvas_x / total_scale
         pdf_y = canvas_y / total_scale
         
-        self.draw_crosshair(canvas, canvas_x, canvas_y, pdf_x, pdf_y)
+        self.draw_crosshair(canvas, canvas_x, canvas_y, pdf_x, pdf_y, found_word)
         # -------------------------------
 
         # Find word under cursor
@@ -326,6 +337,9 @@ class PDFAnalyzerApp:
                 found_word = word
                 break
         
+        # Update state with found word (for copy functionality)
+        state["hovered_word"] = found_word
+        
         if found_word:
             text_content = (f"Text: {found_word['text']}\n"
                             f"x0: {found_word['x0']:.2f}, top: {found_word['top']:.2f}\n"
@@ -333,15 +347,28 @@ class PDFAnalyzerApp:
             self.show_hover_data(canvas, event, text_content)
         else:
             self.hide_hover_data(canvas)
+            
+        # Draw crosshair LAST so it's on top
+        # Calculate PDF coordinates (un-scale)
+        pdf_x = canvas_x / total_scale
+        pdf_y = canvas_y / total_scale
+        
+        self.draw_crosshair(canvas, canvas_x, canvas_y, pdf_x, pdf_y, found_word)
 
-    def draw_crosshair(self, canvas, x, y, pdf_x, pdf_y):
+    def on_click(self, event, path):
+        if path not in self.view_states:
+            return
+        state = self.view_states[path]
+        
+        # If we are hovering a word, copy it
+        if state.get("hovered_word"):
+            self.copy_to_clipboard(state["hovered_word"])
+
+    def draw_crosshair(self, canvas, x, y, pdf_x, pdf_y, found_word):
         # Remove old crosshair
         canvas.delete("crosshair")
         
-        # Get canvas current view boundaries (for drawing lines across screen)
-        # We want lines to span the full scrollable area or visible area?
-        # Typically crosshairs span the visible viewport or the whole image.
-        # Let's span the whole scrollregion (image size) so it looks like "lines to the border of the pdf"
+        # Get canvas current view boundaries
         region = canvas.bbox("all")
         if not region:
             return
@@ -352,23 +379,73 @@ class PDFAnalyzerApp:
         # Draw horizontal line
         canvas.create_line(min_x, y, max_x, y, fill="blue", dash=(4, 4), tags="crosshair")
 
-        # Draw coordinate label in top-left (floating on screen, not scrolling with canvas?)
-        # Actually user said "display coordinates in top left". 
-        # We can draw a text on the canvas but it might scroll away.
-        # Better to put a label widget on top of the canvas or update a static label.
-        # Let's draw it on canvas at (x+10, y+10) or fixed at top-left of *visible* screen.
-        
-        # Let's try fixed at top-left of VISIBLE screen area
-        # canvas.canvasx(0) gives the x-coordinate of the left edge of the visible area
+        # Fixed top-left UI
         view_x = canvas.canvasx(0)
         view_y = canvas.canvasy(0)
         
         coord_text = f"X: {pdf_x:.2f}, Y: {pdf_y:.2f}"
         
-        # Draw a background rectangle for readability
-        canvas.create_rectangle(view_x + 5, view_y + 5, view_x + 120, view_y + 25, 
+        # Box width
+        box_width = 120
+        
+        # Draw background
+        canvas.create_rectangle(view_x + 5, view_y + 5, view_x + box_width, view_y + 25, 
                                 fill="white", outline="black", tags="crosshair")
+        
+        # Draw Coords
         canvas.create_text(view_x + 10, view_y + 15, text=coord_text, anchor="w", fill="black", tags="crosshair")
+
+    def copy_to_clipboard(self, word_data):
+        try:
+            # Format data nicely
+            data_str = str(word_data)
+            self.root.clipboard_clear()
+            self.root.clipboard_append(data_str)
+            self.root.update() # Required to finalize clipboard
+            
+            # Show temporary overlay message instead of blocking alert
+            self.show_toast("Word Copied!")
+            
+        except Exception as e:
+            print(f"Copy failed: {e}")
+
+    def show_toast(self, message, duration=1000):
+        # Create a transient window
+        toast = tk.Toplevel(self.root)
+        toast.wm_overrideredirect(True)
+        
+        # Position it centered or near mouse? Let's center on screen for visibility
+        x = self.root.winfo_x() + self.root.winfo_width() // 2
+        y = self.root.winfo_y() + self.root.winfo_height() // 2
+        toast.wm_geometry(f"+{x}+{y}")
+        
+        label = tk.Label(toast, text=message, bg="black", fg="white", padx=20, pady=10, font=("Arial", 12))
+        label.pack()
+        
+        # Auto destroy
+        toast.after(duration, toast.destroy)
+
+    def copy_file_data(self, path):
+        try:
+            # Extract data from ALL pages
+            all_data = []
+            with pdfplumber.open(path) as pdf:
+                for i, page in enumerate(pdf.pages):
+                    words = page.extract_words()
+                    # Add page number to each word for context
+                    for w in words:
+                        w['page'] = i + 1
+                    all_data.extend(words)
+            
+            data_str = str(all_data)
+            self.root.clipboard_clear()
+            self.root.clipboard_append(data_str)
+            self.root.update()
+            
+            messagebox.showinfo("Copied", f"Extracted data from {len(all_data)} words across all pages to clipboard.")
+            
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to copy file data: {e}")
 
     def display_current_page(self, path):
         if path not in self.view_states:
